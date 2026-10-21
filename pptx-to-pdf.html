@@ -1,0 +1,350 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PPTX to PDF</title>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;600;800&display=swap" rel="stylesheet">
+<style>
+:root{--ink:#000;--paper:#fff;--line:2px}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--paper);color:var(--ink)}
+body{font:400 16px/1.5 Archivo,Helvetica,Arial,sans-serif;padding:48px 20px 80px}
+main{max-width:880px;margin:0 auto}
+h1{font-size:clamp(40px,8vw,76px);line-height:1;letter-spacing:-.03em;font-weight:800;margin:0 0 12px}
+.sub{margin:0 0 36px;max-width:52ch}
+.drop{display:block;border:var(--line) solid var(--ink);padding:44px 20px;text-align:center;cursor:pointer;font-weight:600}
+.drop:hover,.drop.over{background:var(--ink);color:var(--paper)}
+.drop input{position:absolute;opacity:0;pointer-events:none}
+.drop:focus-within{outline:var(--line) solid var(--ink);outline-offset:4px}
+fieldset{border:var(--line) solid var(--ink);margin:20px 0;padding:0;display:flex}
+legend{padding:0 8px;font-weight:600}
+fieldset label{flex:1;padding:14px 16px;cursor:pointer;display:block}
+fieldset label+label{border-left:var(--line) solid var(--ink)}
+fieldset input{position:absolute;opacity:0}
+fieldset label:has(input:checked){background:var(--ink);color:var(--paper)}
+fieldset label:has(input:focus-visible){outline:var(--line) solid var(--ink);outline-offset:-6px}
+fieldset small{display:block;font-weight:400;opacity:.8}
+.bar{display:flex;gap:16px;align-items:center;justify-content:space-between;flex-wrap:wrap;margin:20px 0}
+#status{font-weight:600}
+button{font:600 16px Archivo,Helvetica,Arial,sans-serif;background:var(--paper);color:var(--ink);border:var(--line) solid var(--ink);padding:12px 24px;cursor:pointer}
+button:hover:not(:disabled){background:var(--ink);color:var(--paper)}
+button:focus-visible{outline:var(--line) solid var(--ink);outline-offset:4px}
+button:disabled{opacity:.3;cursor:not-allowed}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:16px}
+.grid figure{margin:0}
+section{margin:0 0 36px}
+h2{font-size:20px;font-weight:600;margin:0 0 12px;padding-bottom:8px;border-bottom:var(--line) solid var(--ink);overflow-wrap:anywhere}
+.err{border:var(--line) solid var(--ink);padding:12px 16px;margin:0}
+.grid canvas{width:100%;height:auto;display:block;border:var(--line) solid var(--ink)}
+.grid figcaption{font-size:14px;margin-top:4px}
+</style>
+</head>
+<body>
+<main>
+  <h1>PPTX to PDF</h1>
+  <p class="sub">Black and white output. Everything runs in your browser; your file is never uploaded.</p>
+
+  <label class="drop" id="drop">
+    <input type="file" id="file" accept=".pptx" multiple>
+    Drop one or more .pptx files here, or click to choose
+  </label>
+
+  <fieldset>
+    <legend>Style</legend>
+    <label><input type="radio" name="mode" value="outline" checked>Outline<small>Shapes as outlines, text in black</small></label>
+    <label><input type="radio" name="mode" value="gray"><span>Grayscale</span><small>Fills kept as gray tones</small></label>
+  </fieldset>
+
+  <div class="bar">
+    <span id="status">No files selected</span>
+    <button id="dl" disabled>Download</button>
+  </div>
+  <div id="grid"></div>
+</main>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script>
+/* ---------- Tunable constants ---------- */
+const CFG = {
+  RENDER_WIDTH: 1600,      // px width each slide is rasterised at
+  JPEG_QUALITY: 0.92,      // PDF image quality (0-1)
+  STROKE_PX: 3,            // outline stroke width at RENDER_WIDTH
+  DEFAULT_FONT_PT: 18,     // body text when the file gives no size
+  TITLE_FONT_PT: 40,       // title placeholder when the file gives no size
+  LINE_HEIGHT: 1.2,
+  DARK_FILL_LUM: 0.45,     // grayscale mode: fills darker than this get white text
+  FONT: 'Archivo, Helvetica, Arial, sans-serif'
+};
+/* --------------------------------------- */
+
+const R = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+const $ = id => document.getElementById(id);
+const parseXml = s => new DOMParser().parseFromString(s, 'application/xml');
+const kids = (el, n) => [...el.children].filter(c => c.localName === n);
+const kid = (el, n) => el && kids(el, n)[0];
+const find = (el, n) => el.getElementsByTagNameNS('*', n);
+const lum = h => { const n = parseInt(h, 16); return (.299 * (n >> 16) + .587 * (n >> 8 & 255) + .114 * (n & 255)) / 255; };
+const norm = p => { const o = []; for (const s of p.split('/')) { if (s === '..') o.pop(); else if (s && s !== '.') o.push(s); } return o.join('/'); };
+
+const state = { files: [], busy: false };  // files: [{ name, zip, size, canvases }]
+
+async function readRels(zip, part) {
+  const d = part.replace(/[^/]+$/, ''), f = zip.file(d + '_rels/' + part.split('/').pop() + '.rels'), m = {};
+  if (!f) return m;
+  for (const r of find(parseXml(await f.async('string')), 'Relationship')) {
+    const t = r.getAttribute('Target');
+    m[r.getAttribute('Id')] = { type: r.getAttribute('Type'), path: t.startsWith('/') ? norm(t) : norm(d + t) };
+  }
+  return m;
+}
+
+function xf(sp) {
+  const pr = kid(sp, 'spPr') || kid(sp, 'grpSpPr'), x = pr && kid(pr, 'xfrm');
+  if (!x) return null;
+  const o = kid(x, 'off'), e = kid(x, 'ext');
+  return { x: +o.getAttribute('x'), y: +o.getAttribute('y'), w: +e.getAttribute('cx'), h: +e.getAttribute('cy'),
+    rot: +(x.getAttribute('rot') || 0) / 60000, fh: x.getAttribute('flipH') === '1', fv: x.getAttribute('flipV') === '1' };
+}
+
+function* shapes(tree, map) {
+  for (const c of tree.children) {
+    const n = c.localName;
+    if (n === 'grpSp') {
+      const g = kid(c, 'grpSpPr'), x = g && kid(g, 'xfrm');
+      let m2 = map;
+      if (x && kid(x, 'chOff')) {
+        const o = kid(x, 'off'), e = kid(x, 'ext'), co = kid(x, 'chOff'), ce = kid(x, 'chExt');
+        const ox = +o.getAttribute('x'), oy = +o.getAttribute('y'), ew = +e.getAttribute('cx'), eh = +e.getAttribute('cy');
+        const cx = +co.getAttribute('x'), cy = +co.getAttribute('y'), cw = +ce.getAttribute('cx') || 1, ch = +ce.getAttribute('cy') || 1;
+        m2 = b => map({ ...b, x: ox + (b.x - cx) * ew / cw, y: oy + (b.y - cy) * eh / ch, w: b.w * ew / cw, h: b.h * eh / ch });
+      }
+      yield* shapes(c, m2);
+    } else if (n === 'sp' || n === 'pic' || n === 'cxnSp') yield { el: c, n, map };
+  }
+}
+
+function drawText(g, el, box, k, ph, mode, dark) {
+  const tb = kid(el, 'txBody'); if (!tb) return;
+  const bp = kid(tb, 'bodyPr'), at = n => bp && bp.getAttribute(n) != null ? +bp.getAttribute(n) * k : null;
+  const lI = at('lIns') ?? 91440 * k, rI = at('rIns') ?? 91440 * k, tI = at('tIns') ?? 45720 * k, bI = at('bIns') ?? 45720 * k;
+  const na = bp && kid(bp, 'normAutofit'), sc = na && na.getAttribute('fontScale') ? +na.getAttribute('fontScale') / 100000 : 1;
+  const isTitle = ph === 'title' || ph === 'ctrTitle';
+  const baseDefault = isTitle ? CFG.TITLE_FONT_PT : CFG.DEFAULT_FONT_PT;
+  const anchor = (bp && bp.getAttribute('anchor')) || (isTitle ? 'ctr' : 't');
+  const maxW = box.w - lI - rI, lines = [];
+
+  for (const p of kids(tb, 'p')) {
+    const pr = kid(p, 'pPr'), algn = (pr && pr.getAttribute('algn')) || (ph === 'ctrTitle' ? 'ctr' : 'l');
+    const marL = pr && pr.getAttribute('marL') ? +pr.getAttribute('marL') * k : 0;
+    const toks = []; let size = 0;
+    for (const r of p.children) {
+      if (r.localName === 'br') { toks.push({ br: 1 }); continue; }
+      if (r.localName !== 'r' && r.localName !== 'fld') continue;
+      const rp = kid(r, 'rPr'), t = (kid(r, 't') || {}).textContent || '';
+      const pt = (rp && rp.getAttribute('sz') ? +rp.getAttribute('sz') / 100 : baseDefault) * sc, px = pt * 12700 * k;
+      size = Math.max(size, px);
+      const font = `${rp && rp.getAttribute('i') === '1' ? 'italic ' : ''}${rp && rp.getAttribute('b') === '1' || (isTitle && !(rp && rp.getAttribute('b'))) ? '700' : '400'} ${px}px ${CFG.FONT}`;
+      for (const s of t.split(/(\s+)/)) if (s) toks.push({ t: s, font, px });
+    }
+    if (!size) { const ep = kid(p, 'endParaRPr'); size = (ep && ep.getAttribute('sz') ? +ep.getAttribute('sz') / 100 : baseDefault) * sc * 12700 * k; }
+    if (pr && kid(pr, 'buChar') && toks.length) toks.unshift({ t: '\u2022 ', font: `400 ${size}px ${CFG.FONT}`, px: size });
+
+    let line = [], lw = 0;
+    const flush = () => { lines.push({ line, lw, algn, marL, size: Math.max(size, ...line.map(t => t.px)) }); line = []; lw = 0; };
+    for (const t of toks) {
+      if (t.br) { flush(); continue; }
+      g.font = t.font; t.w = g.measureText(t.t).width;
+      const over = lw + t.w > maxW - marL;
+      if (over && !t.t.trim()) continue;
+      if (over && line.length) flush();
+      line.push(t); lw += t.w;
+    }
+    flush();
+  }
+
+  const total = lines.reduce((a, l) => a + l.size * CFG.LINE_HEIGHT, 0), inner = box.h - tI - bI;
+  let y = box.y + tI + (anchor === 'ctr' ? (inner - total) / 2 : anchor === 'b' ? inner - total : 0);
+  g.fillStyle = mode === 'gray' && !dark ? '#000' : (dark ? '#fff' : '#000');
+  g.textBaseline = 'top';
+  for (const l of lines) {
+    const lh = l.size * CFG.LINE_HEIGHT;
+    let x = box.x + lI + l.marL;
+    if (l.algn === 'ctr') x = box.x + lI + (maxW - l.lw) / 2; else if (l.algn === 'r') x = box.x + lI + maxW - l.lw;
+    for (const t of l.line) { g.font = t.font; g.fillText(t.t, x, y + (lh - t.px) / 2); x += t.w; }
+    y += lh;
+  }
+}
+
+async function renderSlide(doc, part, mode, lookup) {
+  const { zip, size } = doc, W = CFG.RENDER_WIDTH, k = W / size.cx, H = Math.round(size.cy * k);
+  const cv = document.createElement('canvas'); cv.width = W; cv.height = H;
+  const g = cv.getContext('2d'); g.fillStyle = '#fff'; g.fillRect(0, 0, W, H);
+  const sx = parseXml(await zip.file(part).async('string')), rel = await readRels(zip, part);
+  const lay = Object.values(rel).find(r => r.type.endsWith('/slideLayout'));
+  const look = lay ? await lookup(lay.path) : () => null;
+
+  for (const { el, n, map } of shapes(find(sx, 'spTree')[0], b => b)) {
+    const phEl = find(el, 'ph')[0], phT = phEl && (phEl.getAttribute('type') || 'body');
+    let b = xf(el) || (phEl && look(phEl));
+    if (!b) continue;
+    b = map(b);
+    const box = { x: b.x * k, y: b.y * k, w: b.w * k, h: b.h * k };
+    g.save();
+    if (b.rot) { g.translate(box.x + box.w / 2, box.y + box.h / 2); g.rotate(b.rot * Math.PI / 180); g.translate(-box.x - box.w / 2, -box.y - box.h / 2); }
+    g.lineWidth = CFG.STROKE_PX; g.strokeStyle = '#000';
+
+    if (n === 'pic') {
+      const bl = find(el, 'blip')[0], id = bl && bl.getAttributeNS(R, 'embed');
+      try {
+        const bmp = await createImageBitmap(await zip.file(rel[id].path).async('blob'));
+        g.drawImage(bmp, box.x, box.y, box.w, box.h);
+      } catch (e) { g.beginPath(); g.moveTo(box.x, box.y); g.lineTo(box.x + box.w, box.y + box.h); g.moveTo(box.x + box.w, box.y); g.lineTo(box.x, box.y + box.h); g.stroke(); }
+      if (mode === 'outline') g.strokeRect(box.x, box.y, box.w, box.h);
+    } else {
+      const pr = kid(el, 'spPr'), geo = pr && kid(pr, 'prstGeom'), prst = geo ? geo.getAttribute('prst') : 'rect';
+      const fillEl = pr && kid(pr, 'solidFill'), ln = pr && kid(pr, 'ln');
+      const lnOn = (ln && !kid(ln, 'noFill')) || n === 'cxnSp';
+      const hex = fillEl && (find(fillEl, 'srgbClr')[0] || {}).getAttribute && find(fillEl, 'srgbClr')[0].getAttribute('val');
+      const fl = hex ? lum(hex) : null;
+      const isLine = n === 'cxnSp' || prst === 'line' || prst === 'straightConnector1';
+
+      if (isLine) {
+        g.beginPath();
+        g.moveTo(b.fh ? box.x + box.w : box.x, b.fv ? box.y + box.h : box.y);
+        g.lineTo(b.fh ? box.x : box.x + box.w, b.fv ? box.y : box.y + box.h);
+        g.stroke();
+      } else if (fillEl || lnOn) {
+        g.beginPath();
+        if (prst === 'ellipse') g.ellipse(box.x + box.w / 2, box.y + box.h / 2, box.w / 2, box.h / 2, 0, 0, 7);
+        else if (prst === 'roundRect' && g.roundRect) g.roundRect(box.x, box.y, box.w, box.h, Math.min(box.w, box.h) * .16);
+        else g.rect(box.x, box.y, box.w, box.h);
+        if (mode === 'gray' && fl !== null) { const v = Math.round(fl * 255); g.fillStyle = `rgb(${v},${v},${v})`; g.fill(); }
+        if (mode === 'outline' || lnOn) g.stroke();
+      }
+      if (!isLine) drawText(g, el, box, k, phT, mode, mode === 'gray' && fl !== null && fl < CFG.DARK_FILL_LUM);
+    }
+    g.restore();
+  }
+
+  // force pure grayscale (catches embedded images)
+  const d = g.getImageData(0, 0, W, H), p = d.data;
+  for (let i = 0; i < p.length; i += 4) p[i] = p[i + 1] = p[i + 2] = .299 * p[i] + .587 * p[i + 1] + .114 * p[i + 2];
+  g.putImageData(d, 0, 0);
+  return cv;
+}
+
+function makeLookup(zip) {
+  const cache = {};
+  return async path => {
+    if (cache[path]) return cache[path];
+    const docs = [parseXml(await zip.file(path).async('string'))];
+    const mp = Object.values(await readRels(zip, path)).find(r => r.type.endsWith('/slideMaster'));
+    if (mp) docs.push(parseXml(await zip.file(mp.path).async('string')));
+    const items = [];
+    for (const d of docs) for (const s of find(d, 'sp')) {
+      const ph = find(s, 'ph')[0], b = xf(s);
+      if (ph && b) items.push({ t: ph.getAttribute('type') || 'body', i: ph.getAttribute('idx'), b });
+    }
+    return cache[path] = ph => {
+      const t = ph.getAttribute('type') || 'body', i = ph.getAttribute('idx');
+      const m = items.find(o => i && o.i === i) || items.find(o => o.t === t || (t === 'ctrTitle' && o.t === 'title'));
+      return m ? m.b : null;
+    };
+  };
+}
+
+async function renderDoc(doc, mode, label) {
+  const lookup = makeLookup(doc.zip);
+  const pres = parseXml(await doc.zip.file('ppt/presentation.xml').async('string')), sz = find(pres, 'sldSz')[0];
+  doc.size = { cx: +sz.getAttribute('cx'), cy: +sz.getAttribute('cy') };
+  const prel = await readRels(doc.zip, 'ppt/presentation.xml');
+  const parts = [...find(pres, 'sldId')].map(s => prel[s.getAttributeNS(R, 'id')].path);
+  const sec = document.createElement('section'), h = document.createElement('h2'), grid = document.createElement('div');
+  h.textContent = doc.name + '.pptx'; grid.className = 'grid'; sec.append(h, grid); $('grid').append(sec);
+  doc.canvases = [];
+  for (let i = 0; i < parts.length; i++) {
+    $('status').textContent = `${label}: slide ${i + 1} of ${parts.length}`;
+    const cv = await renderSlide(doc, parts[i], mode, lookup);
+    doc.canvases.push(cv);
+    const fig = document.createElement('figure');
+    fig.append(cv, Object.assign(document.createElement('figcaption'), { textContent: `Slide ${i + 1}` }));
+    grid.append(fig);
+    await new Promise(r => setTimeout(r));
+  }
+}
+
+async function run() {
+  if (!state.files.length || state.busy) return;
+  state.busy = true; $('dl').disabled = true; $('grid').innerHTML = '';
+  const mode = document.querySelector('input[name=mode]:checked').value;
+  for (const [n, doc] of state.files.entries()) {
+    try { await renderDoc(doc, mode, `File ${n + 1} of ${state.files.length}`); }
+    catch (e) {
+      console.error(e); doc.canvases = [];
+      $('grid').append(Object.assign(document.createElement('p'), { className: 'err', textContent: `Could not read ${doc.name}.pptx` }));
+    }
+  }
+  const ok = state.files.filter(d => d.canvases.length), slides = ok.reduce((a, d) => a + d.canvases.length, 0);
+  $('status').textContent = ok.length ? `${ok.length} file${ok.length > 1 ? 's' : ''}, ${slides} slides ready` : 'Nothing could be converted';
+  $('dl').textContent = ok.length > 1 ? 'Download ZIP' : 'Download PDF';
+  $('dl').disabled = !ok.length;
+  state.busy = false;
+}
+
+async function load(list) {
+  const files = [...list]; if (!files.length || state.busy) return;
+  const skipped = []; state.files = [];
+  $('status').textContent = 'Opening files';
+  for (const f of files) {
+    if (!/\.pptx$/i.test(f.name)) { skipped.push(f.name); continue; }
+    try { state.files.push({ name: f.name.replace(/\.pptx$/i, ''), zip: await JSZip.loadAsync(f) }); }
+    catch (e) { skipped.push(f.name); }
+  }
+  if (!state.files.length) {
+    $('grid').innerHTML = ''; $('dl').disabled = true;
+    $('status').textContent = 'No valid .pptx files. Re-save .ppt files as .pptx first.'; return;
+  }
+  await run();
+  if (skipped.length) $('status').textContent += `. Skipped: ${skipped.join(', ')}`;
+}
+
+function save(blob, name) {
+  const a = Object.assign(document.createElement('a'), { href: URL.createObjectURL(blob), download: name });
+  document.body.append(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+}
+
+function makePdf(doc) {
+  const { jsPDF } = window.jspdf, w = doc.size.cx / 12700, h = doc.size.cy / 12700, o = w >= h ? 'l' : 'p';
+  const pdf = new jsPDF({ orientation: o, unit: 'pt', format: [w, h], compress: true });
+  doc.canvases.forEach((c, i) => {
+    if (i) pdf.addPage([w, h], o);
+    pdf.addImage(c.toDataURL('image/jpeg', CFG.JPEG_QUALITY), 'JPEG', 0, 0, w, h);
+  });
+  return pdf.output('arraybuffer');
+}
+
+async function download() {
+  const ok = state.files.filter(d => d.canvases.length); if (!ok.length) return;
+  if (ok.length === 1) { save(new Blob([makePdf(ok[0])], { type: 'application/pdf' }), ok[0].name + '.pdf'); return; }
+  $('dl').disabled = true; $('status').textContent = 'Building ZIP';
+  const out = new JSZip(), used = new Set();
+  for (const d of ok) {
+    let n = d.name, i = 2; while (used.has(n)) n = `${d.name}-${i++}`;
+    used.add(n); out.file(n + '.pdf', makePdf(d));
+  }
+  save(await out.generateAsync({ type: 'blob' }), 'slides-pdf.zip');
+  $('status').textContent = `${ok.length} PDFs zipped`; $('dl').disabled = false;
+}
+
+$('file').addEventListener('change', e => load(e.target.files));
+$('dl').addEventListener('click', download);
+document.querySelectorAll('input[name=mode]').forEach(r => r.addEventListener('change', run));
+const drop = $('drop');
+['dragenter', 'dragover'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add('over'); }));
+['dragleave', 'drop'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove('over'); }));
+drop.addEventListener('drop', e => load(e.dataTransfer.files));
+</script>
+</body>
+</html>
